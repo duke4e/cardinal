@@ -1,5 +1,6 @@
 mod background;
 mod commands;
+mod icons;
 mod lifecycle;
 mod quicklook;
 mod search_activity;
@@ -120,6 +121,7 @@ pub fn run() -> Result<()> {
             rescan_tx.clone(),
             watch_config_tx.clone(),
             update_window_state_tx.clone(),
+            icon_update_tx.clone(),
         ))
         .invoke_handler(tauri::generate_handler![
             search,
@@ -165,7 +167,8 @@ pub fn run() -> Result<()> {
         s.spawn(|| {
             while let Ok(icon) = icon_update_rx.recv() {
                 let mut icons = vec![icon];
-                std::thread::sleep(Duration::from_millis(100));
+                // Batch icons finishing within about a frame into one event.
+                std::thread::sleep(Duration::from_millis(16));
                 icons.extend(icon_update_rx.try_iter());
                 info!("emitting {} icons", icons.len());
                 app_handle.emit("icon_update", icons).unwrap();

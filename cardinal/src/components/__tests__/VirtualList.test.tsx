@@ -191,3 +191,42 @@ describe('VirtualList frozen viewport', () => {
     });
   });
 });
+
+describe('VirtualList row loading', () => {
+  beforeEach(() => {
+    mockEnsureRangeLoaded.mockReset();
+    mockUseIconViewport.mockReset();
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get: () => 100,
+    });
+  });
+
+  it('loads the visible rows first, then rows within two viewports around them', async () => {
+    mockUseDataLoader.mockImplementation(() => ({
+      cache: new Map<SlabIndex, SearchResultItem>(),
+      ensureRangeLoaded: mockEnsureRangeLoaded,
+    }));
+    const results = Array.from({ length: 100 }, (_, i) => i as SlabIndex);
+
+    render(
+      <VirtualList
+        results={results}
+        dataResultsVersion={1}
+        displayedResultsVersion={1}
+        rowHeight={20}
+        overscan={0}
+        renderRow={(rowIndex, _item, style) => <div key={rowIndex} style={style} />}
+        onScrollSync={vi.fn()}
+      />,
+    );
+
+    // 100px viewport / 20px rows = rows 0..4 visible; 2 viewports = 10 rows of prefetch.
+    await waitFor(() => {
+      expect(mockEnsureRangeLoaded.mock.calls).toEqual([
+        [0, 4],
+        [0, 14],
+      ]);
+    });
+  });
+});

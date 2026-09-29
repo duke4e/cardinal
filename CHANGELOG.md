@@ -6,6 +6,7 @@
 - On startup, a cache built with a different configuration is loaded and searchable right away while a scan with the current configuration replaces it.
 - Faster index build and load: the name index is built by one parallel sort instead of a tree lookup per node (2.0s → 0.4s for 3.5M entries), and interning names no longer walks a B-tree (cache load 1.9s → 1.1s).
 - Incremental rescans fetch metadata with `getattrlistbulk` instead of an `lstat` per entry (~40% faster).
+- Result rows appear instantly while scrolling: row data no longer waits for icons (1–17ms each, rendered one after another), which are now rendered in parallel on a dedicated pool, cached, and streamed in. Rows within two viewports of the visible ones are loaded ahead of time.
 
 ## 0.1.23 — 2026-03-25
 - Reduce power consumption by expanding the default ignored paths to cover more macOS cache, log, metadata, and runtime directories.

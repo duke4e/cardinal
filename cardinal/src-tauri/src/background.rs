@@ -1,16 +1,15 @@
 use crate::{
     commands::{NodeInfoRequest, SearchJob, WatchConfigUpdate},
+    icons,
     lifecycle::{APP_QUIT, AppLifecycleState, load_app_state, update_app_state},
     search_activity,
     window_controls::is_main_window_foreground,
 };
 use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose};
 use cardinal_sdk::{EventFlag, EventWatcher, FsEvent};
 use crossbeam_channel::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use rayon::spawn;
 use search_cache::{
     HandleFSEError, SearchCache, SearchOptions, SearchResultNode, SlabIndex, WalkData,
 };
@@ -321,13 +320,10 @@ fn handle_icon_viewport_update(
         })
         .for_each(|(slab_index, path)| {
             let icon_update_tx = icon_update_tx.clone();
-            spawn(move || {
-                if let Some(icon) = fs_icon::icon_of_path_ql(&path).map(|data| {
-                    format!(
-                        "data:image/png;base64,{}",
-                        general_purpose::STANDARD.encode(&data)
-                    )
-                }) {
+            icons::spawn(move || {
+                if let Some(icon) =
+                    fs_icon::icon_of_path_ql(&path).map(|data| icons::png_data_url(&data))
+                {
                     let _ = icon_update_tx.send(IconPayload { slab_index, icon });
                 }
             });

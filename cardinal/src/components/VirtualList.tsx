@@ -41,6 +41,9 @@ type VirtualListProps = {
   onScrollSync: (scrollLeft: number) => void;
 };
 
+// Viewports worth of rows loaded above and below the visible window.
+const PREFETCH_VIEWPORTS = 2;
+
 // Virtualized list with lazy row hydration plus a short-lived frozen viewport during
 // result-set swaps so the old screen stays visible until the next viewport is ready.
 export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(function VirtualList(
@@ -122,10 +125,15 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
   );
 
   // ----- effects -----
-  // Ensure the data cache stays warm for the active window
+  // Ensure the data cache stays warm for the active window. Row payloads are cheap, so rows
+  // within a couple of viewports are loaded too and are ready before they scroll into view.
+  // The visible window is requested first so its rows (and icons) are served first.
   useEffect(() => {
-    if (end >= start) ensureRangeLoaded(start, end);
-  }, [start, end, ensureRangeLoaded, displayedResultsVersion]);
+    if (end < start) return;
+    ensureRangeLoaded(start, end);
+    const prefetch = (end - start + 1) * PREFETCH_VIEWPORTS;
+    ensureRangeLoaded(Math.max(0, start - prefetch), Math.min(rowCount - 1, end + prefetch));
+  }, [start, end, rowCount, ensureRangeLoaded, displayedResultsVersion]);
 
   // Track container height changes so virtualization recalculates the viewport
   useLayoutEffect(() => {

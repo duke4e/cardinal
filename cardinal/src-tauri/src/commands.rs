@@ -1,5 +1,7 @@
 use crate::{
     DEFAULT_SYSTEM_IGNORE_PATH, LOGIC_START, LogicStartConfig,
+    background::IconPayload,
+    icons,
     lifecycle::load_app_state,
     quicklook::{
         QuickLookItemInput, close_preview_panel, toggle_preview_panel, update_preview_panel,
@@ -9,7 +11,6 @@ use crate::{
     window_controls::{activate_main_window_impl, hide_main_window_impl, toggle_main_window_impl},
 };
 use anyhow::{Result, anyhow};
-use base64::{Engine as _, engine::general_purpose};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use crossbeam_channel::{Sender, bounded};
 use objc2::{
@@ -77,6 +78,7 @@ pub struct SearchState {
     watch_config_tx: Sender<WatchConfigUpdate>,
     sorted_view_cache: Mutex<Option<SortedViewCache>>,
     pub(crate) update_window_state_tx: Sender<()>,
+    icon_update_tx: Sender<IconPayload>,
 }
 
 impl SearchState {
@@ -87,6 +89,7 @@ impl SearchState {
         rescan_tx: Sender<CancellationToken>,
         watch_config_tx: Sender<WatchConfigUpdate>,
         update_window_state_tx: Sender<()>,
+        icon_update_tx: Sender<IconPayload>,
     ) -> Self {
         Self {
             search_tx,
@@ -96,6 +99,7 @@ impl SearchState {
             watch_config_tx,
             sorted_view_cache: Mutex::new(None),
             update_window_state_tx,
+            icon_update_tx,
         }
     }
 
@@ -342,22 +346,19 @@ pub fn get_nodes_info(
     }
 
     let include_icons = include_icons.unwrap_or(true);
-    let nodes = state.request_nodes(results);
+    let nodes = state.request_nodes(results.clone());
 
-    nodes
+    results
         .into_iter()
-        .map(|SearchResultNode { path, metadata }| {
+        .zip(nodes)
+        .map(|(slab_index, SearchResultNode { path, metadata })| {
             let path = path.to_string_lossy().into_owned();
-            let icon = if include_icons {
-                fs_icon::icon_of_path_ns(&path).map(|data| {
-                    format!(
-                        "data:image/png;base64,{}",
-                        general_purpose::STANDARD.encode(data)
-                    )
-                })
-            } else {
-                None
-            };
+            // Rows don't wait for icons that still need rendering; those
+            // arrive as `icon_update` events.
+            let icon = include_icons
+                .then(|| icons::cached_or_request(slab_index, &path, &state.icon_update_tx))
+                .flatten()
+                .map(|icon| icon.to_string());
             NodeInfo {
                 path,
                 icon,
