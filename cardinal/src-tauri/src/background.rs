@@ -91,83 +91,117 @@ pub fn emit_status_bar_update(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_watch_config_update(
+/// Root and ignore/include paths a cache is built for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScanConfig {
+    pub watch_root: String,
+    pub ignore_paths: Vec<PathBuf>,
+    pub include_paths: Vec<PathBuf>,
+}
+
+impl ScanConfig {
+    fn of_cache(cache: &SearchCache, watch_root: &str) -> Self {
+        Self {
+            watch_root: watch_root.to_string(),
+            ignore_paths: cache.ignore_paths().into_vec(),
+            include_paths: cache.include_paths().into_vec(),
+        }
+    }
+}
+
+/// A full scan requested at startup, e.g. because the cache on disk was built
+/// with another configuration and only serves searches until it's replaced.
+pub(crate) struct ScanRequest {
+    pub config: ScanConfig,
+    pub token: CancellationToken,
+}
+
+/// Outcome of a scan run by [`start_scan`].
+struct ScanResult {
+    config: ScanConfig,
+    token: CancellationToken,
+    /// `None` if the scan was cancelled.
+    cache: Option<SearchCache>,
+}
+
+/// Rebuilds the cache on a separate thread; the event loop keeps answering
+/// searches from the current cache and swaps in the new one once it's done
+/// (see [`finish_scan`]). File system events are paused meanwhile and replayed
+/// from the new cache's event id afterwards.
+fn start_scan(
     app_handle: &AppHandle,
-    update: WatchConfigUpdate,
-    cache: &mut SearchCache,
+    request: ScanRequest,
+    scan_done_tx: &Sender<ScanResult>,
     event_watcher: &mut EventWatcher,
-    watch_root: &mut String,
-    fse_latency_secs: f64,
     history_ready: &mut bool,
     processed_events: &mut usize,
 ) {
-    info!("Received watch config update: {:?}", update);
-    let WatchConfigUpdate {
-        watch_root: next_watch_root,
-        ignore_paths,
-        include_paths,
-        scan_cancellation_token,
-    } = update;
-
-    let next_ignore_paths = ignore_paths
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let next_include_paths = include_paths
-        .into_iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-
+    info!("Starting background scan: {:?}", request.config);
     *event_watcher = EventWatcher::noop();
     update_app_state(app_handle, AppLifecycleState::Initializing);
     reset_status_bar(app_handle);
     *history_ready = false;
     *processed_events = 0;
 
-    let next_cache = match build_search_cache(
-        app_handle,
-        &next_watch_root,
-        &next_ignore_paths,
-        &next_include_paths,
-        scan_cancellation_token,
-    ) {
-        Some(cache) => {
-            info!(
-                "Search cache built. New root: {}, ignore paths: {:?}, include paths: {:?}",
-                next_watch_root, next_ignore_paths, next_include_paths
+    let app_handle = app_handle.clone();
+    let scan_done_tx = scan_done_tx.clone();
+    let ScanRequest { config, token } = request;
+    std::thread::Builder::new()
+        .name("cardinal-scan".into())
+        .spawn(move || {
+            let cache = build_search_cache(
+                &app_handle,
+                &config.watch_root,
+                &config.ignore_paths,
+                &config.include_paths,
+                token,
             );
-            emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
-            cache
-        }
-        None => {
-            // if cache build is cancelled, we cannot reuse the old cache since
-            // it's tied to the old watch config; create a noop cache instead
-            info!("Watch config change cancelled, use noop state");
-            SearchCache::noop(
-                PathBuf::from(&next_watch_root),
-                next_ignore_paths,
-                next_include_paths,
-                &APP_QUIT,
-            )
-        }
-    };
+            let _ = scan_done_tx.send(ScanResult {
+                config,
+                token,
+                cache,
+            });
+        })
+        .expect("Failed to spawn scan thread");
+}
 
-    *cache = next_cache;
-    *watch_root = next_watch_root.to_string();
-    *event_watcher = if cache.is_noop() {
-        EventWatcher::noop()
-    } else {
-        update_app_state(app_handle, AppLifecycleState::Updating);
-        EventWatcher::spawn(
-            watch_root.to_string(),
-            cache.last_event_id(),
-            fse_latency_secs,
-            cache.ignore_paths(),
-            cache.include_paths(),
-        )
-        .1
+#[allow(clippy::too_many_arguments)]
+fn finish_scan(
+    app_handle: &AppHandle,
+    result: ScanResult,
+    scan_config: &ScanConfig,
+    cache: &mut SearchCache,
+    event_watcher: &mut EventWatcher,
+    watch_root: &mut String,
+    fse_latency_secs: f64,
+) {
+    let ScanResult {
+        config,
+        token,
+        cache: new_cache,
+    } = result;
+    // A newer request cancelled this scan or superseded its configuration.
+    if token.is_cancelled().is_none() || config != *scan_config {
+        info!("Dropping outdated scan result");
+        return;
+    }
+    let Some(new_cache) = new_cache else {
+        info!("Scan cancelled");
+        return;
     };
+    info!("Scan finished: {:?}", config);
+    *cache = new_cache;
+    *watch_root = config.watch_root;
+    emit_status_bar_update(app_handle, cache.get_total_files(), 0, 0);
+    update_app_state(app_handle, AppLifecycleState::Updating);
+    *event_watcher = EventWatcher::spawn(
+        watch_root.clone(),
+        cache.last_event_id(),
+        fse_latency_secs,
+        cache.ignore_paths(),
+        cache.include_paths(),
+    )
+    .1;
 }
 
 struct EventSnapshot {
@@ -309,6 +343,7 @@ pub fn run_background_event_loop(
     mut watch_root: String,
     fse_latency_secs: f64,
     db_path: PathBuf,
+    initial_scan: Option<ScanRequest>,
 ) {
     let BackgroundLoopChannels {
         finish_rx,
@@ -327,6 +362,20 @@ pub fn run_background_event_loop(
     let mut hide_flush_remaining_ticks: u8 = 0;
     // Hide flush is polled on a 10s ticker; idle flush shares the same tick.
     let flush_ticker = crossbeam_channel::tick(Duration::from_secs(10));
+    let (scan_done_tx, scan_done_rx) = crossbeam_channel::unbounded::<ScanResult>();
+    // Configuration of the latest requested scan, or of the current cache.
+    let mut scan_config = ScanConfig::of_cache(&cache, &watch_root);
+    if let Some(request) = initial_scan {
+        scan_config = request.config.clone();
+        start_scan(
+            app_handle,
+            request,
+            &scan_done_tx,
+            &mut event_watcher,
+            &mut history_ready,
+            &mut processed_events,
+        );
+    }
 
     loop {
         crossbeam_channel::select! {
@@ -379,30 +428,59 @@ pub fn run_background_event_loop(
                 handle_icon_viewport_update(&mut cache, update, &icon_update_tx);
             }
             recv(rescan_rx) -> request => {
-                let scan_cancellation_token = request.expect("Rescan channel closed");
+                let token = request.expect("Rescan channel closed");
                 info!("Manual rescan requested");
-                perform_rescan(
-                    app_handle,
-                    &mut cache,
-                    &mut event_watcher,
-                    &watch_root,
-                    fse_latency_secs,
-                    &mut history_ready,
-                    &mut processed_events,
-                    scan_cancellation_token,
-                );
+                if token.is_cancelled().is_none() {
+                    info!("Skipping stale rescan request");
+                } else {
+                    start_scan(
+                        app_handle,
+                        ScanRequest { config: scan_config.clone(), token },
+                        &scan_done_tx,
+                        &mut event_watcher,
+                        &mut history_ready,
+                        &mut processed_events,
+                    );
+                }
             }
             recv(watch_config_rx) -> update => {
-                let next_update = update.expect("Watch config channel closed");
-                handle_watch_config_update(
+                let WatchConfigUpdate {
+                    watch_root: next_watch_root,
+                    ignore_paths,
+                    include_paths,
+                    scan_cancellation_token,
+                } = update.expect("Watch config channel closed");
+                info!("Received watch config update: {next_watch_root:?}, ignore paths: {ignore_paths:?}, include paths: {include_paths:?}");
+                scan_config = ScanConfig {
+                    watch_root: next_watch_root,
+                    ignore_paths: ignore_paths.into_iter().map(PathBuf::from).collect(),
+                    include_paths: include_paths.into_iter().map(PathBuf::from).collect(),
+                };
+                // Even if a newer rescan was requested meanwhile, it was
+                // started with the previous configuration.
+                let token = match scan_cancellation_token.is_cancelled() {
+                    Some(()) => scan_cancellation_token,
+                    None => CancellationToken::new_scan(),
+                };
+                start_scan(
                     app_handle,
-                    next_update,
+                    ScanRequest { config: scan_config.clone(), token },
+                    &scan_done_tx,
+                    &mut event_watcher,
+                    &mut history_ready,
+                    &mut processed_events,
+                );
+            }
+            recv(scan_done_rx) -> result => {
+                let result = result.expect("Scan channel closed");
+                finish_scan(
+                    app_handle,
+                    result,
+                    &scan_config,
                     &mut cache,
                     &mut event_watcher,
                     &mut watch_root,
                     fse_latency_secs,
-                    &mut history_ready,
-                    &mut processed_events,
                 );
             }
             recv(event_watcher) -> events => {
@@ -446,69 +524,6 @@ pub(crate) fn build_search_cache(
         walking_done.store(true, Ordering::Relaxed);
         cache
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn perform_rescan(
-    app_handle: &AppHandle,
-    cache: &mut SearchCache,
-    event_watcher: &mut EventWatcher,
-    watch_root: &str,
-    fse_latency_secs: f64,
-    history_ready: &mut bool,
-    processed_events: &mut usize,
-    scan_cancellation_token: CancellationToken,
-) {
-    if scan_cancellation_token.is_cancelled().is_none() {
-        info!("Skipping stale rescan request");
-        return;
-    }
-
-    *event_watcher = EventWatcher::noop();
-    update_app_state(app_handle, AppLifecycleState::Initializing);
-    *history_ready = false;
-    *processed_events = 0;
-    reset_status_bar(app_handle);
-
-    let mut phantom1 = PathBuf::new();
-    let mut phantom2 = Vec::new();
-    let mut phantom3 = Vec::new();
-    let walk_data = cache.walk_data(
-        &mut phantom1,
-        &mut phantom2,
-        &mut phantom3,
-        scan_cancellation_token,
-    );
-    let walking_done = AtomicBool::new(false);
-    let stopped = std::thread::scope(|s| {
-        s.spawn(|| {
-            while !walking_done.load(Ordering::Relaxed) {
-                let dirs = walk_data.num_dirs.load(Ordering::Relaxed);
-                let files = walk_data.num_files.load(Ordering::Relaxed);
-                let total = dirs + files;
-                emit_status_bar_update(app_handle, total, 0, 0);
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        });
-        // If rescan is cancelled, we have nothing to do
-        let stopped = cache.rescan_with_walk_data(&walk_data).is_none();
-        walking_done.store(true, Ordering::Relaxed);
-        stopped
-    });
-
-    *event_watcher = if stopped {
-        EventWatcher::noop()
-    } else {
-        update_app_state(app_handle, AppLifecycleState::Updating);
-        EventWatcher::spawn(
-            watch_root.to_string(),
-            cache.last_event_id(),
-            fse_latency_secs,
-            cache.ignore_paths(),
-            cache.include_paths(),
-        )
-        .1
-    };
 }
 
 fn unix_timestamp_now() -> i64 {

@@ -527,6 +527,7 @@ name = "fswalk"
 version = "0.1.0"
 dependencies = [
  "enumn",
+ "libc",
  "memchr",
  "rayon",
  "serde",
@@ -1491,6 +1492,7 @@ dependencies = [
  "tempdir",
  "thin-vec",
  "tracing",
+ "tracing-subscriber",
  "typed-num",
  "unicode-normalization",
  "xattr",

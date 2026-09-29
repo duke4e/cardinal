@@ -8,8 +8,8 @@ mod window_controls;
 
 use anyhow::{Context, Result};
 use background::{
-    BackgroundLoopChannels, IconPayload, build_search_cache, emit_status_bar_update,
-    run_background_event_loop,
+    BackgroundLoopChannels, IconPayload, ScanConfig, ScanRequest, build_search_cache,
+    emit_status_bar_update, run_background_event_loop,
 };
 use cardinal_sdk::EventWatcher;
 use commands::{
@@ -240,13 +240,23 @@ fn run_logic_thread(
     let ignore_paths: Vec<_> = ignore_paths.into_iter().map(PathBuf::from).collect();
     let include_paths: Vec<_> = include_paths.into_iter().map(PathBuf::from).collect();
 
-    let mut cache = match SearchCache::try_read_persistent_cache(
-        &path,
-        db_path,
-        &ignore_paths,
-        &include_paths,
-        &APP_QUIT,
-    ) {
+    let mut initial_scan = None;
+    let loaded = SearchCache::read_persistent_cache(db_path, &APP_QUIT).inspect(|cache| {
+        if let Err(e) = cache.check_config(&path, &ignore_paths, &include_paths) {
+            // Serve searches from what the last run indexed until a scan with
+            // the current configuration replaces it.
+            info!("Using outdated cache while rescanning: {e:?}");
+            initial_scan = Some(ScanRequest {
+                config: ScanConfig {
+                    watch_root: watch_root.clone(),
+                    ignore_paths: ignore_paths.clone(),
+                    include_paths: include_paths.clone(),
+                },
+                token: CancellationToken::new_scan(),
+            });
+        }
+    });
+    let mut cache = match loaded {
         Ok(cached) => {
             info!("Loaded existing cache");
             emit_status_bar_update(app_handle, cached.get_total_files(), 0, 0);
@@ -284,7 +294,10 @@ fn run_logic_thread(
         }
     };
 
-    let event_watcher = if cache.is_noop() {
+    let event_watcher = if initial_scan.is_some() {
+        // Started once the outdated cache is replaced.
+        EventWatcher::noop()
+    } else if cache.is_noop() {
         info!("Using noop event watcher due to cancelled initial scan");
         EventWatcher::noop()
     } else {
@@ -309,6 +322,7 @@ fn run_logic_thread(
         watch_root.to_string(),
         FSE_LATENCY_SECS,
         db_path.to_path_buf(),
+        initial_scan,
     );
 
     info!("Background thread exited");

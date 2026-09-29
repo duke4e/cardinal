@@ -299,3 +299,120 @@ fn walk_without_root_chain_respects_prefix_ignore() {
     );
     assert!(tree.children.iter().any(|c| &*c.name == "stay.txt"));
 }
+
+fn child<'a>(node: &'a fswalk::Node, name: &str) -> Option<&'a fswalk::Node> {
+    node.children.iter().find(|c| &*c.name == name)
+}
+
+/// Dotfiles and files hidden with `chflags hidden` are indexed like any other.
+#[test]
+fn hidden_entries_are_walked() {
+    let tmp = TempDir::new("fswalk_hidden").unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join(".hidden_dir/nested")).unwrap();
+    fs::write(root.join(".hidden_dir/nested/.env"), b"").unwrap();
+    fs::write(root.join(".DS_Store"), b"").unwrap();
+    fs::write(root.join("flagged.txt"), b"").unwrap();
+    let status = std::process::Command::new("chflags")
+        .arg("hidden")
+        .arg(root.join("flagged.txt"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    for need_metadata in [false, true] {
+        let walk_data = WalkData::new(root, &[], &[], need_metadata, || false);
+        let tree = fswalk::walk_it_without_root_chain(&walk_data).expect("root node");
+        let names: Vec<&str> = tree.children.iter().map(|c| &*c.name).collect();
+        assert_eq!(names, [".DS_Store", ".hidden_dir", "flagged.txt"]);
+        let nested = child(child(&tree, ".hidden_dir").unwrap(), "nested").unwrap();
+        assert!(child(nested, ".env").is_some());
+    }
+}
+
+/// With metadata requested, every entry's metadata matches `lstat`.
+#[test]
+fn metadata_matches_lstat() {
+    let tmp = TempDir::new("fswalk_meta_lstat").unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("dir/sub")).unwrap();
+    fs::write(root.join("dir/sub/data.bin"), vec![7u8; 12345]).unwrap();
+    fs::write(root.join("empty.txt"), b"").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("dir/sub/data.bin", root.join("link")).unwrap();
+
+    let walk_data = WalkData::new(root, &[], &[], true, || false);
+    let tree = fswalk::walk_it_without_root_chain(&walk_data).expect("root node");
+
+    fn check(node: &fswalk::Node, path: &Path) {
+        let actual = node.metadata.expect("metadata requested");
+        let expected = fswalk::NodeMetadata::from(fs::symlink_metadata(path).unwrap());
+        assert_eq!(actual.r#type, expected.r#type, "{path:?}");
+        if actual.r#type != NodeFileType::Dir {
+            assert_eq!(actual.size, expected.size, "{path:?}");
+        }
+        assert_eq!(actual.ctime, expected.ctime, "{path:?}");
+        assert_eq!(actual.mtime, expected.mtime, "{path:?}");
+        for c in &node.children {
+            check(c, &path.join(&*c.name));
+        }
+    }
+    for c in &tree.children {
+        check(c, &root.join(&*c.name));
+    }
+    assert_eq!(
+        child(&tree, "link").unwrap().metadata.unwrap().r#type,
+        NodeFileType::Symlink
+    );
+}
+
+/// Ignore and include entries nested several levels deep still compose by
+/// longest prefix when reached through the walker.
+#[test]
+fn nested_ignore_and_include_are_applied_during_walk() {
+    let tmp = TempDir::new("fswalk_nested_rules").unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("a/b/c")).unwrap();
+    fs::create_dir_all(root.join("a/x")).unwrap();
+    fs::write(root.join("a/b/keep.txt"), b"").unwrap();
+    fs::write(root.join("a/b/c/drop.txt"), b"").unwrap();
+    fs::write(root.join("a/x/drop.txt"), b"").unwrap();
+    fs::write(root.join("a/drop.txt"), b"").unwrap();
+
+    let ignore = vec![root.join("a"), root.join("a/b/c")];
+    let include = vec![root.join("a/b")];
+    let walk_data = WalkData::new(root, &ignore, &include, false, || false);
+    let tree = fswalk::walk_it_without_root_chain(&walk_data).expect("root node");
+
+    let a = child(&tree, "a").expect("ancestor of an include is kept");
+    let names: Vec<&str> = a.children.iter().map(|c| &*c.name).collect();
+    assert_eq!(names, ["b"]);
+    let b = child(a, "b").unwrap();
+    let names: Vec<&str> = b.children.iter().map(|c| &*c.name).collect();
+    assert_eq!(names, ["keep.txt"]);
+}
+
+/// A root that itself lies inside an ignored directory has all its entries
+/// ignored, like before.
+#[test]
+fn root_inside_ignored_directory_is_empty() {
+    let tmp = TempDir::new("fswalk_root_ignored").unwrap();
+    let root = tmp.path().join("inner");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/file.txt"), b"").unwrap();
+
+    let ignore = vec![tmp.path().to_path_buf()];
+    let walk_data = WalkData::new(&root, &ignore, &[], false, || false);
+    let tree = fswalk::walk_it_without_root_chain(&walk_data).expect("root node");
+    assert!(tree.children.is_empty());
+}
+
+#[test]
+fn skipped_mount_points_lie_strictly_below_root() {
+    let tmp = TempDir::new("fswalk_mounts").unwrap();
+    assert!(fswalk::skipped_mount_points(tmp.path()).is_empty());
+    for mount in fswalk::skipped_mount_points(Path::new("/")) {
+        assert_ne!(mount, Path::new("/"));
+        assert!(mount.is_absolute());
+    }
+}

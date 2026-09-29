@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- Skip mount points hidden from Finder (`nobrowse`) or not local below the watch root: system volumes, simulator runtimes, `/dev`, network shares and FSKit mounts such as `~/Library/Developer/CoreDevice/DeviceFS`. On a machine with a paired iPhone and simulators this cut a full index of `/` from ~9 minutes to ~7 seconds and dropped ~2M simulator-runtime entries. Include paths can still opt back in.
+- Rescans and watch-config changes run in the background: searches keep being answered from the current index until the new one is ready.
+- On startup, a cache built with a different configuration is loaded and searchable right away while a scan with the current configuration replaces it.
+- Faster index build and load: the name index is built by one parallel sort instead of a tree lookup per node (2.0s → 0.4s for 3.5M entries), and interning names no longer walks a B-tree (cache load 1.9s → 1.1s).
+- Incremental rescans fetch metadata with `getattrlistbulk` instead of an `lstat` per entry (~40% faster).
+
 ## 0.1.23 — 2026-03-25
 - Reduce power consumption by expanding the default ignored paths to cover more macOS cache, log, metadata, and runtime directories.
 - Further reduce background work by making the filesystem event watcher honor ignored paths.

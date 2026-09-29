@@ -1,5 +1,6 @@
 use crate::{FileNodes, NAME_POOL, SlabIndex};
 use itertools::Itertools;
+use rayon::slice::ParallelSliceMut;
 use search_cancel::CancellationToken;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Instant};
@@ -43,13 +44,6 @@ impl SortedSlabIndices {
         }) {
             self.indices.insert(pos, index);
         }
-    }
-
-    /// # Safety
-    ///
-    /// The index must be inserted with it's full path ordered.
-    pub unsafe fn insert_ordered(&mut self, index: SlabIndex) {
-        self.indices.push(index);
     }
 
     pub fn remove(&mut self, index: SlabIndex) -> bool {
@@ -99,18 +93,23 @@ impl NameIndex {
         self.map.get_mut(name)
     }
 
+    /// Builds the index from `(name, index)` pairs of names in the name pool.
+    ///
     /// # Safety
     ///
-    /// The index must be inserted with it's full path ordered.
-    pub unsafe fn add_index_ordered(&mut self, name: &str, index: SlabIndex) {
-        if let Some(existing) = self.map.get_mut(name) {
-            unsafe {
-                existing.insert_ordered(index);
-            }
-        } else {
-            let interned = NAME_POOL.push(name);
-            self.map.insert(interned, SortedSlabIndices::new(index));
-        }
+    /// The pairs must be ordered by the full path of their nodes.
+    pub unsafe fn from_path_ordered(mut names: Vec<(&'static str, SlabIndex)>) -> Self {
+        // A stable sort keeps nodes that share a name in path order; building
+        // the map from sorted entries avoids a tree lookup per node.
+        names.par_sort_by(|a, b| a.0.cmp(b.0));
+        let map = names
+            .chunk_by(|a, b| a.0 == b.0)
+            .map(|chunk| {
+                let indices = chunk.iter().map(|&(_, index)| index).collect();
+                (chunk[0].0, SortedSlabIndices { indices })
+            })
+            .collect();
+        Self { map }
     }
 
     pub fn add_index(&mut self, name: &str, index: SlabIndex, slab: &FileNodes) {
@@ -153,11 +152,11 @@ impl NameIndex {
 
     pub fn construct_name_pool(data: BTreeMap<Box<str>, SortedSlabIndices>) -> Self {
         let name_pool_time = Instant::now();
-        let mut map = BTreeMap::new();
-        for (name, indices) in data {
-            let interned = NAME_POOL.push(&name);
-            map.insert(interned, indices);
-        }
+        // `data` is sorted, so collecting bulk-builds the map.
+        let map: BTreeMap<_, _> = data
+            .into_iter()
+            .map(|(name, indices)| (NAME_POOL.push(&name), indices))
+            .collect();
         info!(
             "Name pool construction time: {:?}, count: {}",
             name_pool_time.elapsed(),

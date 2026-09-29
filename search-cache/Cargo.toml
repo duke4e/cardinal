@@ -36,6 +36,7 @@ tempdir = "0.3"
 plist = "1.7"
 xattr = "1.4"
 criterion = { version = "0.8", features = ["html_reports"] }
+tracing-subscriber = "0.3"
 
 [[bench]]
 name = "walk_and_search"

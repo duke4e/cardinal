@@ -1,4 +1,7 @@
-use rayon::{iter::ParallelBridge, prelude::ParallelIterator};
+#[cfg(target_os = "macos")]
+mod bulk;
+
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::{
@@ -7,7 +10,7 @@ use std::{
     num::NonZeroU64,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
     time::UNIX_EPOCH,
 };
 
@@ -182,6 +185,7 @@ impl<'w, F: Fn() -> bool> WalkData<'w, F> {
         }
     }
 
+    #[cfg(test)]
     fn should_ignore(&self, path: &Path) -> bool {
         should_ignore_path(path, self.ignore_directories, self.include_paths)
     }
@@ -248,62 +252,17 @@ fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>)
     let metadata = metadata_of_path(path);
     let children = if metadata.as_ref().map(|x| x.is_dir()).unwrap_or_default() {
         walk_data.num_dirs.fetch_add(1, Ordering::Relaxed);
-        let read_dir = fs::read_dir(path);
-        match read_dir {
-            Ok(entries) => {
-                let cancelled = AtomicBool::new(false);
-                let results: Vec<_> = entries
-                    .into_iter()
-                    .par_bridge()
-                    .map(|entry| {
-                        match &entry {
-                            Ok(entry) => {
-                                if walk_data.is_cancelled() {
-                                    cancelled.store(true, Ordering::Relaxed);
-                                    return None;
-                                }
-                                let path = entry.path();
-                                if walk_data.should_ignore(&path) {
-                                    return None;
-                                }
-                                // doesn't traverse symlink
-                                if let Ok(data) = entry.file_type() {
-                                    if data.is_dir() {
-                                        walk(&path, walk_data)
-                                    } else {
-                                        walk_data.num_files.fetch_add(1, Ordering::Relaxed);
-                                        let name = entry
-                                            .file_name()
-                                            .to_string_lossy()
-                                            .into_owned()
-                                            .into_boxed_str();
-                                        Some(Node {
-                                            children: vec![],
-                                            name,
-                                            metadata: walk_data
-                                                .need_metadata
-                                                .then_some(entry)
-                                                .and_then(|entry| {
-                                                    // doesn't traverse symlink
-                                                    entry.metadata().ok().map(NodeMetadata::from)
-                                                }),
-                                        })
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            Err(_) => None,
-                        }
-                    })
-                    .collect();
-                if cancelled.load(Ordering::Acquire) {
-                    return None;
-                }
-                results.into_iter().flatten().collect()
-            }
-            Err(_) => Vec::new(),
-        }
+        let ctx = WalkContext::new(walk_data);
+        // Entries of ignore/include lists that lie strictly below the directory
+        // being listed; only then can one of its entries be ignored.
+        let pending: Vec<&Path> = ctx
+            .ignore_directories
+            .iter()
+            .chain(walk_data.include_paths)
+            .map(PathBuf::as_path)
+            .filter(|entry| entry.starts_with(path) && *entry != path)
+            .collect();
+        walk_children(path, &pending, &ctx)?
     } else {
         walk_data.num_files.fetch_add(1, Ordering::Relaxed);
         Vec::new()
@@ -315,13 +274,173 @@ fn walk<F: Fn() -> bool + Send + Sync>(path: &Path, walk_data: &WalkData<'_, F>)
         .file_name()
         .map(|x| x.to_string_lossy().into_owned().into_boxed_str())
         .unwrap_or_default();
-    let mut children = children;
-    children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     Some(Node {
         children,
         name,
         metadata: metadata.map(NodeMetadata::from),
     })
+}
+
+struct WalkContext<'c, 'w, F: Fn() -> bool> {
+    walk_data: &'c WalkData<'w, F>,
+    /// `walk_data.ignore_directories` plus mount points that are skipped
+    /// automatically.
+    ignore_directories: Vec<PathBuf>,
+    /// The root itself lies below an ignore or include entry, so ancestors
+    /// decide about every entry and each one has to be checked.
+    check_all: bool,
+}
+
+impl<'c, 'w, F: Fn() -> bool> WalkContext<'c, 'w, F> {
+    fn new(walk_data: &'c WalkData<'w, F>) -> Self {
+        let root = walk_data.root_path;
+        let mut ignore_directories = walk_data.ignore_directories.to_vec();
+        ignore_directories.extend(skipped_mount_points(root));
+        let check_all = ignore_directories
+            .iter()
+            .chain(walk_data.include_paths)
+            .any(|entry| root.starts_with(entry));
+        Self {
+            walk_data,
+            ignore_directories,
+            check_all,
+        }
+    }
+
+    fn should_ignore(&self, path: &Path) -> bool {
+        should_ignore_path(path, &self.ignore_directories, self.walk_data.include_paths)
+    }
+}
+
+/// An entry of a directory listing.
+struct DirEntry {
+    name: Box<str>,
+    /// `None` if the listing couldn't tell.
+    r#type: Option<NodeFileType>,
+    metadata: Option<NodeMetadata>,
+}
+
+/// Returns the sorted children of the directory at `path`, or `None` if the
+/// walk was cancelled. `pending` holds the ignore and include entries below
+/// `path`.
+fn walk_children<F: Fn() -> bool + Send + Sync>(
+    path: &Path,
+    pending: &[&Path],
+    ctx: &WalkContext<'_, '_, F>,
+) -> Option<Vec<Node>> {
+    let walk_data = ctx.walk_data;
+    if walk_data.is_cancelled() {
+        return None;
+    }
+    let Ok(entries) = list_dir(path, walk_data.need_metadata) else {
+        return Some(Vec::new());
+    };
+    let check_ignore = ctx.check_all || !pending.is_empty();
+
+    let mut children = Vec::with_capacity(entries.len());
+    let mut dirs = Vec::new();
+    for mut entry in entries {
+        if check_ignore && ctx.should_ignore(&path.join(&*entry.name)) {
+            continue;
+        }
+        let r#type = match entry.r#type {
+            Some(r#type) => r#type,
+            None => {
+                let Some(metadata) = metadata_of_path(&path.join(&*entry.name)) else {
+                    continue;
+                };
+                entry.metadata = Some(NodeMetadata::new(&metadata));
+                metadata.file_type().into()
+            }
+        };
+        if r#type == NodeFileType::Dir {
+            dirs.push(entry);
+        } else {
+            children.push(Node {
+                children: Vec::new(),
+                name: entry.name,
+                metadata: entry.metadata,
+            });
+        }
+    }
+    walk_data
+        .num_files
+        .fetch_add(children.len(), Ordering::Relaxed);
+
+    let walk_dir = |entry: DirEntry| -> Option<Node> {
+        walk_data.num_dirs.fetch_add(1, Ordering::Relaxed);
+        let child_path = path.join(&*entry.name);
+        let child_pending: Vec<&Path> = pending
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with(&child_path) && *p != child_path)
+            .collect();
+        Some(Node {
+            children: walk_children(&child_path, &child_pending, ctx)?,
+            name: entry.name,
+            metadata: entry.metadata,
+        })
+    };
+    // Subdirectories are listed in parallel; recursing through rayon keeps
+    // every core busy without handing out single entries.
+    if dirs.len() > 1 {
+        let dirs: Vec<Option<Node>> = dirs.into_par_iter().map(walk_dir).collect();
+        for dir in dirs {
+            children.push(dir?);
+        }
+    } else {
+        for dir in dirs {
+            children.push(walk_dir(dir)?);
+        }
+    }
+    if walk_data.is_cancelled() {
+        return None;
+    }
+    children.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    Some(children)
+}
+
+/// Lists a directory. Directory entries always carry metadata, other entries
+/// only if `need_metadata` is set.
+fn list_dir(path: &Path, need_metadata: bool) -> std::io::Result<Vec<DirEntry>> {
+    // `getattrlistbulk` beats `lstat` per entry by ~40% when metadata is
+    // needed, but plain `readdir` only touches directory records and is about
+    // twice as fast when just names and types are.
+    #[cfg(target_os = "macos")]
+    if need_metadata && let Some(entries) = bulk::list_dir(path)? {
+        return Ok(entries);
+    }
+    Ok(fs::read_dir(path)?
+        .flatten()
+        .map(|entry| {
+            let r#type = entry.file_type().ok().map(NodeFileType::from);
+            // doesn't traverse symlink
+            let metadata = (need_metadata || r#type == Some(NodeFileType::Dir))
+                .then(|| entry.metadata().ok().map(NodeMetadata::from))
+                .flatten();
+            DirEntry {
+                name: entry
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+                    .into_boxed_str(),
+                r#type,
+                metadata,
+            }
+        })
+        .collect())
+}
+
+/// Mount points below `root` that are never descended into unless an include
+/// path asks for them; see [`bulk::skipped_mount_points`].
+pub fn skipped_mount_points(root: &Path) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return bulk::skipped_mount_points(root);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = root;
+        Vec::new()
+    }
 }
 
 fn handle_error_and_retry(failed: &Error) -> bool {

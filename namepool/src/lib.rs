@@ -2,11 +2,63 @@
 use core::str;
 use parking_lot::Mutex;
 use regex::Regex;
+use rustc_hash::FxBuildHasher;
 use search_cancel::CancellationToken;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 pub struct NamePool {
-    inner: Mutex<BTreeSet<Box<str>>>,
+    inner: Mutex<Names>,
+}
+
+/// Size of the arena chunks names are copied into.
+const CHUNK_SIZE: usize = 1 << 20;
+
+#[derive(Default)]
+struct Names {
+    /// Arena holding the name bytes. A chunk is never grown past its initial
+    /// capacity, so the bytes never move.
+    chunks: Vec<Vec<u8>>,
+    /// Every name in insertion order; searches scan this, which reads the
+    /// arena sequentially.
+    names: Vec<&'static str>,
+    /// For O(1) `push`.
+    lookup: HashSet<&'static str, FxBuildHasher>,
+}
+
+impl Names {
+    fn iter(&self) -> impl Iterator<Item = &&'static str> {
+        self.names.iter()
+    }
+
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn intern(&mut self, name: &str) -> &'static str {
+        if let Some(&existing) = self.lookup.get(name) {
+            return existing;
+        }
+        let chunk = match self.chunks.last_mut() {
+            Some(chunk) if chunk.capacity() - chunk.len() >= name.len() => chunk,
+            _ => {
+                self.chunks
+                    .push(Vec::with_capacity(CHUNK_SIZE.max(name.len())));
+                self.chunks.last_mut().unwrap()
+            }
+        };
+        let start = chunk.len();
+        chunk.extend_from_slice(name.as_bytes());
+        // SAFETY: the bytes were copied from a `str` and stay in place for as
+        // long as the pool lives, see `chunks`.
+        let interned = unsafe { str::from_raw_parts(chunk.as_ptr().add(start), name.len()) };
+        self.names.push(interned);
+        self.lookup.insert(interned);
+        interned
+    }
 }
 
 impl std::fmt::Debug for NamePool {
@@ -26,7 +78,7 @@ impl Default for NamePool {
 impl NamePool {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(BTreeSet::new()),
+            inner: Mutex::new(Names::default()),
         }
     }
 
@@ -50,12 +102,7 @@ impl NamePool {
     /// One important feature of NamePool is that the returned offset is stable
     /// and won't be overwritten.
     pub fn push<'c>(&'c self, name: &str) -> &'c str {
-        let mut inner = self.inner.lock();
-        if !inner.contains(name) {
-            inner.insert(name.into());
-        }
-        let existing = inner.get(name).unwrap();
-        unsafe { str::from_raw_parts(existing.as_ptr(), existing.len()) }
+        self.inner.lock().intern(name)
     }
 
     pub fn search_substr<'search, 'pool: 'search>(

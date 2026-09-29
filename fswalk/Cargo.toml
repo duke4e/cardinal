@@ -12,3 +12,6 @@ enumn = "0.1.14"
 
 [dev-dependencies]
 tempdir = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.171"

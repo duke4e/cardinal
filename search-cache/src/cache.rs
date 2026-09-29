@@ -5,11 +5,12 @@ use crate::{
     persistent::{PersistentStorage, read_cache_from_file, write_cache_to_file},
     query_preprocessor::{expand_query_home_dirs, strip_query_quotes},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use cardinal_sdk::{EventFlag, FsEvent, ScanType, current_event_id};
 use cardinal_syntax::{Expr, Filter, FilterKind, Term, optimize_query, parse_query};
 use fswalk::{
-    Node, NodeMetadata, WalkData, should_ignore_path, walk_it, walk_it_without_root_chain,
+    Node, NodeMetadata, WalkData, should_ignore_path, skipped_mount_points, walk_it,
+    walk_it_without_root_chain,
 };
 use hashbrown::HashSet;
 use namepool::NamePool;
@@ -139,61 +140,90 @@ impl SearchCache {
         current_include_paths: &Vec<PathBuf>,
         cancel: &'static AtomicBool,
     ) -> Result<Self> {
-        read_cache_from_file(cache_path)
-            .and_then(|x| {
-                (x.path == path)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent root path: expected: {:?}, actual: {:?}",
-                            path,
-                            &x.path
-                        )
-                    })
-                    .map(|()| x)
-            })
-            .and_then(|x| {
-                (&x.ignore_paths == current_ignore_paths)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent ignore paths: expected: {:?}, actual: {:?}",
-                            &current_ignore_paths,
-                            &x.ignore_paths
-                        )
-                    })
-                    .map(|()| x)
-            })
-            .and_then(|x| {
-                (&x.include_paths == current_include_paths)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Inconsistent include paths: expected: {:?}, actual: {:?}",
-                            &current_include_paths,
-                            &x.include_paths
-                        )
-                    })
-                    .map(|()| x)
-            })
-            .map(
-                |PersistentStorage {
-                     version: _,
-                     path,
-                     ignore_paths,
-                     include_paths,
-                     slab_root,
-                     slab,
-                     name_index,
-                     last_event_id,
-                     rescan_count,
-                 }| {
-                    // name pool construction speed is fast enough that caching it doesn't worth it.
-                    let name_index = NameIndex::construct_name_pool(name_index);
-                    let slab = FileNodes::new(path, ignore_paths, include_paths, slab, slab_root);
-                    Self::new(slab, last_event_id, rescan_count, name_index, cancel)
-                },
-            )
+        let cache = Self::read_persistent_cache(cache_path, cancel)?;
+        cache.check_config(path, current_ignore_paths, current_include_paths)?;
+        Ok(cache)
+    }
+
+    /// Reads the cache at `cache_path` whatever configuration it was built
+    /// with. A cache built with another configuration can still answer
+    /// searches while a scan with the new one runs; see [`Self::check_config`].
+    pub fn read_persistent_cache(cache_path: &Path, cancel: &'static AtomicBool) -> Result<Self> {
+        let PersistentStorage {
+            version: _,
+            path,
+            ignore_paths,
+            include_paths,
+            slab_root,
+            slab,
+            name_index,
+            last_event_id,
+            rescan_count,
+        } = read_cache_from_file(cache_path)?;
+        // name pool construction speed is fast enough that caching it doesn't worth it.
+        let name_index = NameIndex::construct_name_pool(name_index);
+        let slab = FileNodes::new(path, ignore_paths, include_paths, slab, slab_root);
+        let mut cache = Self::new(slab, last_event_id, rescan_count, name_index, cancel);
+        cache.prune_skipped_mounts();
+        Ok(cache)
+    }
+
+    /// Errors if the cache wasn't built for the given root and ignore and
+    /// include paths.
+    pub fn check_config(
+        &self,
+        path: &Path,
+        ignore_paths: &Vec<PathBuf>,
+        include_paths: &Vec<PathBuf>,
+    ) -> Result<()> {
+        if self.file_nodes.path() != path {
+            bail!(
+                "Inconsistent root path: expected: {:?}, actual: {:?}",
+                path,
+                self.file_nodes.path()
+            );
+        }
+        if self.file_nodes.ignore_paths() != ignore_paths {
+            bail!(
+                "Inconsistent ignore paths: expected: {:?}, actual: {:?}",
+                ignore_paths,
+                self.file_nodes.ignore_paths()
+            );
+        }
+        if self.file_nodes.include_paths() != include_paths {
+            bail!(
+                "Inconsistent include paths: expected: {:?}, actual: {:?}",
+                include_paths,
+                self.file_nodes.include_paths()
+            );
+        }
+        Ok(())
+    }
+
+    /// Removes nodes below mount points that scans skip (see
+    /// [`skipped_mount_points`]), e.g. from caches written before they were
+    /// skipped.
+    fn prune_skipped_mounts(&mut self) {
+        let mounts = skipped_mount_points(self.file_nodes.path());
+        for mount in &mounts {
+            if should_ignore_path(mount, &mounts, self.file_nodes.include_paths()) {
+                self.remove_node_path(mount);
+            }
+        }
+    }
+
+    /// Paths of `events` to rescan, minus those in skipped mounts.
+    fn event_scan_paths(&self, events: Vec<FsEvent>) -> Vec<PathBuf> {
+        let mut scan_paths = scan_paths(events);
+        if !scan_paths.is_empty() {
+            let mounts = skipped_mount_points(self.file_nodes.path());
+            if !mounts.is_empty() {
+                scan_paths.retain(|path| {
+                    !should_ignore_path(path, &mounts, self.file_nodes.include_paths())
+                });
+            }
+        }
+        scan_paths
     }
 
     /// Get the total number of files and directories in the cache.
@@ -249,8 +279,7 @@ impl SearchCache {
             // Then create the slab.
             let slab_time = Instant::now();
             let mut slab = ThinSlab::new();
-            let mut name_index = NameIndex::default();
-            let slab_root = construct_node_slab_name_index(None, &node, &mut slab, &mut name_index);
+            let (slab_root, name_index) = construct_node_slab_name_index(&node, &mut slab);
             info!(
                 "Slab & NameIndex construction time: {:?}, slab root: {:?}, slab len: {:?}",
                 slab_time.elapsed(),
@@ -933,7 +962,7 @@ impl SearchCache {
             self.rescan_count = self.rescan_count.saturating_add(1);
             return Err(HandleFSEError::Rescan);
         }
-        for scan_path in scan_paths(events) {
+        for scan_path in self.event_scan_paths(events) {
             info!("Scanning path: {scan_path:?}");
             let folder = self.scan_path_recursive(&scan_path);
             if folder.is_some() {
@@ -1054,31 +1083,42 @@ pub enum HandleFSEError {
     Rescan,
 }
 
+/// Builds the slab for the tree under `node` and returns the index of its
+/// root together with the name index.
+///
 /// Note: This function is expected to be called with WalkData which metadata is not fetched.
 fn construct_node_slab_name_index(
-    parent: Option<SlabIndex>,
     node: &Node,
     slab: &mut ThinSlab<SlabNode>,
-    name_index: &mut NameIndex,
-) -> SlabIndex {
-    let metadata = match node.metadata {
-        Some(metadata) => SlabNodeMetadataCompact::some(metadata),
-        None => SlabNodeMetadataCompact::none(),
-    };
-    let name = NAME_POOL.push(&node.name);
-    let slab_node = SlabNode::new(parent, name, metadata);
-    let index = slab.insert(slab_node);
-    unsafe {
-        // SAFETY: fswalk sorts each directory's children by name before we recurse,
-        // so this preorder traversal visits nodes in lexicographic path order.
-        name_index.add_index_ordered(name, index);
+) -> (SlabIndex, NameIndex) {
+    fn construct_node_slab(
+        parent: Option<SlabIndex>,
+        node: &Node,
+        slab: &mut ThinSlab<SlabNode>,
+        names: &mut Vec<(&'static str, SlabIndex)>,
+    ) -> SlabIndex {
+        let metadata = match node.metadata {
+            Some(metadata) => SlabNodeMetadataCompact::some(metadata),
+            None => SlabNodeMetadataCompact::none(),
+        };
+        let name = NAME_POOL.push(&node.name);
+        let slab_node = SlabNode::new(parent, name, metadata);
+        let index = slab.insert(slab_node);
+        names.push((name, index));
+        slab[index].children = node
+            .children
+            .iter()
+            .map(|node| construct_node_slab(Some(index), node, slab, names))
+            .collect();
+        index
     }
-    slab[index].children = node
-        .children
-        .iter()
-        .map(|node| construct_node_slab_name_index(Some(index), node, slab, name_index))
-        .collect();
-    index
+
+    let mut names = Vec::new();
+    let root = construct_node_slab(None, node, slab, &mut names);
+    // SAFETY: fswalk sorts each directory's children by name before we recurse,
+    // so this preorder traversal visits nodes in lexicographic path order.
+    let name_index = unsafe { NameIndex::from_path_ordered(names) };
+    (root, name_index)
 }
 
 impl SearchCache {
@@ -2147,8 +2187,7 @@ mod tests {
             ],
         );
         let mut slab = ThinSlab::new();
-        let mut name_index = NameIndex::default();
-        let root = construct_node_slab_name_index(None, &tree, &mut slab, &mut name_index);
+        let (root, name_index) = construct_node_slab_name_index(&tree, &mut slab);
         let file_nodes = FileNodes::new(
             PathBuf::from("/virtual/root"),
             Vec::new(),
